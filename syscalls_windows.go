@@ -2,9 +2,11 @@ package water
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -198,40 +200,12 @@ func getdeviceid(componentID string, interfaceName string) (deviceid string, err
 	return "", fmt.Errorf("Failed to find the tap device in registry with specified ComponentId '%s', TAP driver may be not installed", componentID)
 }
 
-// setStatus is used to bring up or bring down the interface
-func setStatus(fd syscall.Handle, status bool) error {
+func deviceIoControl(fd syscall.Handle, code uint32, inBuffers ...[]byte) ([]byte, error) {
 	var bytesReturned uint32
-	rdbbuf := make([]byte, syscall.MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
-	code := []byte{0x00, 0x00, 0x00, 0x00}
-	if status {
-		code[0] = 0x01
-	}
-	return syscall.DeviceIoControl(fd, tap_ioctl_set_media_status, &code[0], uint32(4), &rdbbuf[0], uint32(len(rdbbuf)), &bytesReturned, nil)
-}
-
-// setTUN is used to configure the IP address in the underlying driver when using TUN
-func setTUN(fd syscall.Handle, network string) error {
-	var bytesReturned uint32
-	rdbbuf := make([]byte, syscall.MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
-
-	localIP, remoteNet, err := net.ParseCIDR(network)
-	if err != nil {
-		return fmt.Errorf("Failed to parse network CIDR in config, %v", err)
-	}
-	if localIP.To4() == nil {
-		return fmt.Errorf("Provided network(%s) is not a valid IPv4 address", network)
-	}
-	code2 := make([]byte, 0, 12)
-	code2 = append(code2, localIP.To4()[:4]...)
-	code2 = append(code2, remoteNet.IP.To4()[:4]...)
-	code2 = append(code2, remoteNet.Mask[:4]...)
-	if len(code2) != 12 {
-		return fmt.Errorf("Provided network(%s) is not valid", network)
-	}
-	if err := syscall.DeviceIoControl(fd, tap_ioctl_config_tun, &code2[0], uint32(12), &rdbbuf[0], uint32(len(rdbbuf)), &bytesReturned, nil); err != nil {
-		return err
-	}
-	return nil
+	inBuffer := bytes.Join(inBuffers, []byte{})
+	outBuffer := make([]byte, syscall.MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
+	err := syscall.DeviceIoControl(fd, code, &inBuffer[0], uint32(len(inBuffer)), &outBuffer[0], uint32(len(outBuffer)), &bytesReturned, nil)
+	return outBuffer[:bytesReturned], err
 }
 
 // openDev find and open an interface.
@@ -260,11 +234,9 @@ func openDev(config Config) (ifce *Interface, err error) {
 	if err != nil {
 		return nil, err
 	}
-	var bytesReturned uint32
 
 	// find the mac address of tap device, use this to find the name of interface
-	mac := make([]byte, 6)
-	err = syscall.DeviceIoControl(file, tap_win_ioctl_get_mac, &mac[0], uint32(len(mac)), &mac[0], uint32(len(mac)), &bytesReturned, nil)
+	mac, err := deviceIoControl(file, tap_win_ioctl_get_mac, make([]byte, 6))
 	if err != nil {
 		return nil, err
 	}
@@ -279,18 +251,65 @@ func openDev(config Config) (ifce *Interface, err error) {
 		return
 	}
 	fd := &wfile{fd: file, ro: ro, wo: wo}
-	ifce = &Interface{isTAP: (config.DeviceType == TAP), ReadWriteCloser: fd}
+	ifce = &Interface{isTAP: (config.DeviceType == TAP), ReadWriteCloser: fd, fd: int(file)}
 
-	// bring up device.
-	if err := setStatus(file, true); err != nil {
-		return nil, err
-	}
-
-	//TUN
-	if config.DeviceType == TUN {
-		if err := setTUN(file, config.PlatformSpecificParams.Network); err != nil {
+	if len(config.PlatformSpecificParams.Network) > 0 {
+		ip, ipn, err := net.ParseCIDR(config.PlatformSpecificParams.Network)
+		if nil != err {
 			return nil, err
 		}
+
+		ip = ip.To4()
+		ipNet := ipn.IP.To4()
+		if nil == ip || nil == ipNet || 4 != len(ipn.Mask) {
+			return nil, errors.New("ipv4 supported only")
+		}
+
+		gateway := make([]byte, 4)
+		copy(gateway, ip)
+		gateway[3] = 1 + ip[3]%254
+
+		// Note.
+		// If the adapter is not configured to DHCP auto acquire, the following controls will not work.
+
+		// set ip address
+		lease := make([]byte, 4)
+		binary.BigEndian.PutUint32(lease, 60*60*24*365)
+		_, err = deviceIoControl(file, tap_win_ioctl_config_dhcp_masq, ip, ipn.Mask, gateway, lease)
+		if err != nil {
+			return nil, err
+		}
+
+		// make tap work in tun mode (packet without Ethernet Header), default tap mode (packet with Ethernet Header)
+		if TUN == config.DeviceType {
+			_, err = deviceIoControl(file, tap_ioctl_config_tun, ip, ipNet, ipn.Mask)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+	}
+
+	if len(config.PlatformSpecificParams.DnsServers) > 0 {
+		buffer := make([]byte, 2, 2+2*4)
+		buffer[0] = 6
+		for _, dns := range strings.Fields(config.PlatformSpecificParams.DnsServers) {
+			buffer[1] += 4
+			buffer = append(buffer, net.ParseIP(dns).To4()...)
+		}
+
+		// set dns
+		_, err = deviceIoControl(file, tap_win_ioctl_config_dhcp_set_opt, buffer)
+		if err != nil {
+			return nil, err
+		}
+
+	}
+
+	// set link up
+	_, err = deviceIoControl(file, tap_ioctl_set_media_status, []byte{1, 0, 0, 0})
+	if err != nil {
+		return nil, err
 	}
 
 	// find the name of tap interface(u need it to set the ip or other command)

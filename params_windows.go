@@ -24,6 +24,9 @@ type PlatformSpecificParams struct {
 	// https://github.com/OpenVPN/tap-windows6/blob/master/src/device.c#L431
 	// and https://github.com/songgao/water/pull/13#issuecomment-270341777
 	Network string
+	// dns separated by space
+	// 8.8.8.8 8.8.4.4
+	DnsServers string
 }
 
 func defaultPlatformSpecificParams() PlatformSpecificParams {

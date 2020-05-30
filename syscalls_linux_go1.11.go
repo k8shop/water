@@ -23,5 +23,6 @@ func openDev(config Config) (ifce *Interface, err error) {
 		isTAP:           config.DeviceType == TAP,
 		ReadWriteCloser: os.NewFile(uintptr(fdInt), "tun"),
 		name:            name,
+		fd:              fdInt,
 	}, nil
 }

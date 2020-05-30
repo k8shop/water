@@ -146,6 +146,7 @@ func openDevSystem(config Config) (ifce *Interface, err error) {
 	}
 
 	return &Interface{
+		fd:    fd,
 		isTAP: false,
 		name:  string(ifName.name[:ifNameSize-1 /* -1 is for \0 */]),
 		ReadWriteCloser: &tunReadCloser{
@@ -204,6 +205,7 @@ func openDevTunTapOSX(config Config) (ifce *Interface, err error) {
 		isTAP:           config.DeviceType == TAP,
 		ReadWriteCloser: os.NewFile(uintptr(fd), "tun"),
 		name:            config.Name,
+		fd:              fd,
 	}, nil
 }
 
